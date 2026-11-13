@@ -1,0 +1,28 @@
+import axios from 'axios';
+
+export const apiClient = axios.create({
+  baseURL: import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://localhost:8080' : ''),
+});
+
+export function uploadImage(file, sensitive = false) {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('sensitive', String(sensitive));
+  return apiClient.post('/api/images', formData).then((res) => res.data);
+}
+
+export function listImages() {
+  return apiClient.get('/api/images').then((res) => res.data);
+}
+
+export function likeImage(filename) {
+  return apiClient.post(`/api/images/${filename}/like`).then((res) => res.data);
+}
+
+export function retryBlur(filename) {
+  return apiClient.post(`/api/images/${filename}/blur`).then((res) => res.data);
+}
+
+export function getServerInfo() {
+  return apiClient.get('/api/server').then((res) => res.data);
+}
