@@ -1,0 +1,188 @@
+name: Frontend CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Permisos mínimos por defecto. id-token: write se concede solo en los jobs
+# que se autentican contra AWS.
+permissions:
+  contents: read
+
+# Cancela ejecuciones antiguas de la misma rama/PR, salvo en main: un despliegue
+# a producción en curso nunca se interrumpe (se encolan).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  NODE_VERSION: '22' # Vite 8 requiere Node ^20.19.0 || >=22.12.0
+  AWS_REGION: us-east-2
+  AWS_ROLE_ARN: arn:aws:iam::525388658102:role/github-actions-thaki-frontend-role
+  S3_BUCKET: thaki-site-frontend
+  CLOUDFRONT_DISTRIBUTION_ID: EVLO45IHXVWUB
+  API_URL: https://api.thaki.site
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: se ejecuta en todas las ramas y PRs. No tiene acceso a AWS.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Validate and Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js (con caché de npm)
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build # carga .env.production (VITE_API_URL)
+
+      - name: Verify dist/
+        run: |
+          test -d dist || { echo "::error::No se generó dist/"; exit 1; }
+          test -f dist/index.html || { echo "::error::Falta dist/index.html"; exit 1; }
+          ls dist/assets/*.js >/dev/null 2>&1 || { echo "::error::dist/assets/ sin bundles JS"; exit 1; }
+          # VITE_API_URL se incrusta en el bundle en tiempo de build
+          grep -rqF "$API_URL" dist/assets || { echo "::error::El bundle no apunta a $API_URL"; exit 1; }
+          echo "dist/ OK:"; find dist -type f | sort
+
+      # Solo se publica el artefacto cuando habrá despliegue, para que el
+      # deploy suba exactamente lo que se validó (sin recompilar).
+      - name: Upload dist artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Job 2: solo push a main y tras validar correctamente.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to S3
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-session-name: gha-thaki-frontend-deploy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 1) Assets con hash (nombre cambia en cada build): caché de 1 año.
+      #    Se suben PRIMERO para que existan antes de publicar el nuevo index.html.
+      # ⚠️ --delete: borra de s3://thaki-site-frontend/assets/ los ficheros que ya
+      #    no existan en dist/assets/ (bundles de builds anteriores).
+      - name: Sync hashed assets
+        run: |
+          aws s3 sync dist/assets "s3://$S3_BUCKET/assets" \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable" \
+            --no-progress
+
+      # 2) Resto (index.html, favicon, etc.): revalidación obligatoria, así el
+      #    navegador/CDN nunca sirve un index.html antiguo que apunte a assets borrados.
+      # ⚠️ --delete: borra de la RAÍZ del bucket todo objeto que no exista en dist/
+      #    (excepto assets/, excluido aquí). Cualquier fichero subido a mano al
+      #    bucket fuera de assets/ se eliminará en el próximo despliegue.
+      - name: Sync root files (index.html, etc.)
+        run: |
+          aws s3 sync dist "s3://$S3_BUCKET" \
+            --exclude "assets/*" \
+            --delete \
+            --cache-control "no-cache, max-age=0, must-revalidate" \
+            --no-progress
+
+      - name: Deployment summary
+        run: |
+          {
+            echo "## 🚀 Despliegue a S3"
+            echo ""
+            echo "| Campo | Valor |"
+            echo "|---|---|"
+            echo "| Bucket | \`s3://$S3_BUCKET\` |"
+            echo "| Commit | \`${GITHUB_SHA::7}\` |"
+            echo "| Autor | ${GITHUB_ACTOR} |"
+            echo "| Ficheros | $(find dist -type f | wc -l) |"
+            echo "| Tamaño | $(du -sh dist | cut -f1) |"
+            echo ""
+            echo "<details><summary>Ficheros publicados</summary>"
+            echo ""
+            echo '```'
+            find dist -type f | sed 's|^dist/||' | sort
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Job 3: solo si el despliegue a S3 terminó bien.
+  # ---------------------------------------------------------------------------
+  invalidate:
+    name: Invalidate CloudFront
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-session-name: gha-thaki-frontend-invalidate-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create invalidation
+        id: invalidation
+        run: |
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths "/*" \
+            --query 'Invalidation.Id' \
+            --output text)
+          echo "id=$INVALIDATION_ID" >> "$GITHUB_OUTPUT"
+          echo "Invalidation ID: $INVALIDATION_ID"
+
+      - name: Invalidation summary
+        run: |
+          {
+            echo "## 🌐 Invalidación de CloudFront"
+            echo ""
+            echo "| Campo | Valor |"
+            echo "|---|---|"
+            echo "| Distribución | \`$CLOUDFRONT_DISTRIBUTION_ID\` |"
+            echo "| Invalidation ID | \`${{ steps.invalidation.outputs.id }}\` |"
+            echo "| Rutas | \`/*\` |"
+            echo "| Sitio | https://thaki.site |"
+          } >> "$GITHUB_STEP_SUMMARY"
